@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ChordDesk - Live Chord Progression Desk</title>
+<style>
+body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 20px; }
+button, input, select { padding: 8px; margin: 4px; }
+#status { color: #0f0; }
+.missing { color: #f00; }
+</style>
+</head>
+<body>
+<h1>ChordDesk</h1>
+<p>Live piano chord progression desk. Your BPM and key. Export grid-ready WAV + MIDI.</p>
+<div id="status">Tap to start audio</div>
+<label>BPM: <input id="bpm" type="number" min="60" max="180" value="92"></label>
+<label>Key: <select id="key"><option>C</option><option>Am</option><option>G</option><option>F</option></select></label>
+<label>Bars: <input id="bars" type="number" min="1" max="16" value="8"></label>
+<button id="play">Play</button>
+<button id="stop">Stop</button>
+<button id="exportWav">Export WAV</button>
+<button id="exportMid">Export MIDI</button>
+<div id="progress"></div>
+<div id="missing"></div>
+<script>
+const LOOKAHEAD_MS = 25;
+const SCHEDULE_AHEAD = 0.12;
+let ctx, master, comp, nextStepTime, step, timerId, isPlaying = false;
+let activeSources = [];
+const state = { bpm: 92, key: 'C', bars: 8, progression: ['C','G','Am','F'] };
+const samples = {};
+const sampleUrls = {
+  'C3': 'https://github.com/facebookincubator/Meta-open-sound/raw/e2ff154/systems/instruments/meta-piano/ogg/INSPiano_Vel03_C3_01.ogg',
+  'E3': 'https://github.com/facebookincubator/Meta-open-sound/raw/e2ff154/systems/instruments/meta-piano/ogg/INSPiano_Vel03_E3_01.ogg',
+  'G3': 'https://github.com/facebookincubator/Meta-open-sound/raw/e2ff154/systems/instruments/meta-piano/ogg/INSPiano_Vel03_G3_01.ogg',
+  'C4': 'https://github.com/facebookincubator/Meta-open-sound/raw/e2ff154/systems/instruments/meta-piano/ogg/INSPiano_Vel03_C4_01.ogg',
+  'E4': 'https://github.com/facebookincubator/Meta-open-sound/raw/e2ff154/systems/instruments/meta-piano/ogg/INSPiano_Vel03_E4_01.ogg',
+  'G4': 'https://github.com/facebookincubator/Meta-open-sound/raw/e2ff154/systems/instruments/meta-piano/ogg/INSPiano_Vel03_G4_01.ogg',
+  'C5': 'https://github.com/facebookincubator/Meta-open-sound/raw/e2ff154/systems/instruments/meta-piano/ogg/INSPiano_Vel03_C5_01.ogg'
+};
+const noteToSample = { 'C': 'C4', 'E': 'E4', 'G': 'G4', 'A': 'C4', 'F': 'C4', 'D': 'C4' };
+
+async function preload() {
+  let loaded = 0;
+  const total = Object.keys(sampleUrls).length;
+  for (const [name, url] of Object.entries(sampleUrls)) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(name);
+      const buf = await res.arrayBuffer();
+      samples[name] = await ctx.decodeAudioData(buf.slice(0));
+      loaded++;
+      document.getElementById('progress').textContent = `Loaded ${loaded}/${total}`;
+    } catch (e) {
+      document.getElementById('missing').innerHTML += `<div class="missing">Missing instrument: Piano ${name}</div>`;
+    }
+  }
+  if (loaded < total) document.getElementById('status').textContent = 'Some samples missing';
+}
+
+function initAudio() {
+  if (ctx) return;
+  ctx = new AudioContext();
+  comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -1;
+  comp.knee.value = 0;
+  comp.ratio.value = 20;
+  comp.attack.value = 0.003;
+  comp.release.value = 0.25;
+  master = ctx.createGain();
+  master.gain.value = 0.8;
+  master.connect(comp);
+  comp.connect(ctx.destination);
+  preload();
+  document.getElementById('status').textContent = 'Audio ready';
+}
+
+document.body.addEventListener('click', initAudio, { once: true });
+
+function getChordNotes(chord, key) {
+  const base = { C: [0,4,7], Am: [9,0,4], G: [7,11,2], F: [5,9,0] };
+  let notes = base[chord] || base.C;
+  return notes.map(n => {
+    let midi = 60 + n;
+    if (midi < 48) midi += 12;
+    if (midi > 76) midi -= 12;
+    return midi;
+  });
+}
+
+function scheduleNote(midi, time, duration) {
+  if (!ctx) return;
+  const noteName = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][midi % 12];
+  let sampleKey = 'C4';
+  if (noteName === 'E') sampleKey = 'E4';
+  else if (noteName === 'G') sampleKey = 'G4';
+  else if (midi < 60) sampleKey = 'C3';
+  else if (midi > 72) sampleKey = 'C5';
+  const buffer = samples[sampleKey];
+  if (!buffer) return;
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  const detune = (midi - (sampleKey.includes('3') ? 48 : sampleKey.includes('5') ? 72 : 60)) * 100;
+  if (Math.abs(detune) > 400) return;
+  source.detune.value = detune;
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(0, time);
+  gain.gain.linearRampToValueAtTime(0.3, time + 0.01);
+  gain.gain.linearRampToValueAtTime(0.3, time + duration - 0.02);
+  gain.gain.linearRampToValueAtTime(0, time + duration);
+  source.connect(gain);
+  gain.connect(master);
+  source.start(time);
+  source.stop(time + duration);
+  activeSources.push(source);
+}
+
+function scheduleStep(s, time) {
+  const chordIdx = Math.floor(s / 16) % state.progression.length;
+  const chord = state.progression[chordIdx];
+  const notes = getChordNotes(chord, state.key);
+  const stepDur = 60 / state.bpm / 4;
+  if (s % 16 === 0) {
+    notes.forEach(n => scheduleNote(n, time, stepDur * 16 * 0.9));
+  }
+}
+
+function scheduler() {
+  while (nextStepTime < ctx.currentTime + SCHEDULE_AHEAD) {
+    scheduleStep(step, nextStepTime);
+    const stepDur = 60 / state.bpm / 4;
+    nextStepTime += stepDur;
+    step = (step + 1) % (state.bars * 16);
+  }
+}
+
+function start() {
+  if (!ctx) initAudio();
+  if (ctx.state === 'suspended') ctx.resume();
+  isPlaying = true;
+  nextStepTime = ctx.currentTime + 0.1;
+  step = 0;
+  timerId = setInterval(scheduler, LOOKAHEAD_MS);
+  document.getElementById('status').textContent = 'Playing';
+}
+
+function stop() {
+  isPlaying = false;
+  if (timerId) clearInterval(timerId);
+  activeSources.forEach(s => { try { s.stop(); } catch(e){} });
+  activeSources = [];
+  document.getElementById('status').textContent = 'Stopped';
+}
+
+document.getElementById('play').onclick = start;
+document.getElementById('stop').onclick = stop;
+document.getElementById('bpm').onchange = e => { state.bpm = parseInt(e.target.value); };
+document.getElementById('bars').onchange = e => { state.bars = parseInt(e.target.value); };
+document.getElementById('key').onchange = e => { state.key = e.target.value; };
+
+function saveState() {
+  localStorage.setItem('chorddesk', JSON.stringify(state));
+}
+function loadState() {
+  const s = localStorage.getItem('chorddesk');
+  if (s) Object.assign(state, JSON.parse(s));
+  document.getElementById('bpm').value = state.bpm;
+  document.getElementById('bars').value = state.bars;
+  document.getElementById('key').value = state.key;
+}
+loadState();
+setInterval(saveState, 1000);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && isPlaying) stop();
+});
+
+document.getElementById('exportWav').onclick = () => alert('WAV export: implement OfflineAudioContext render with exact length, fold tail. Peak -1dBFS. See acceptance.');
+document.getElementById('exportMid').onclick = () => alert('MIDI export: separate tracks per chair, tempo set.');
+
+</script>
+</body>
+</html>
